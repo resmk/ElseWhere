@@ -1,0 +1,1229 @@
+import re
+import time
+import json
+from typing import List, Dict, Any, Optional
+
+import requests
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
+
+# ============================================================
+# Config
+# ============================================================
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_MODEL = "gemma3:1b"  # if not installed, we auto-fallback to first available
+
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+SESSION = requests.Session()
+
+
+# ============================================================
+# Ollama helpers
+# ============================================================
+def ollama_list_models() -> List[str]:
+    """
+    Returns installed model names from /api/tags.
+    """
+    r = SESSION.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    models = data.get("models") or []
+    names = []
+    for m in models:
+        name = m.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def pick_model(requested: str) -> str:
+    """
+    If requested model isn't installed, fallback to first installed model.
+    """
+    requested = (requested or "").strip()
+    installed = ollama_list_models()
+
+    if not installed:
+        raise RuntimeError("No Ollama models installed. Run: `ollama pull llama3.2` (or any model)")
+
+    if requested and requested in installed:
+        return requested
+
+    # fallback
+    return installed[0]
+
+
+def _post_json(path: str, payload: dict, timeout: int = 180) -> requests.Response:
+    return SESSION.post(f"{OLLAMA_BASE_URL}{path}", json=payload, timeout=timeout)
+
+
+def ollama_generate(model: str, prompt: str, temperature: float = 0.8) -> str:
+    """
+    Prefer /api/chat, fall back to /api/generate.
+    """
+    # 1) chat
+    r = _post_json(
+        "/api/chat",
+        {
+            "model": model,
+            "stream": False,
+            "options": {"temperature": float(temperature), "top_p": 0.9},
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=180,
+    )
+
+    if r.status_code != 404 and r.ok:
+        data = r.json()
+        text = ((data.get("message", {}) or {}).get("content", "") or "").strip()
+        if text:
+            return text
+
+    # 2) generate
+    r2 = _post_json(
+        "/api/generate",
+        {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": float(temperature), "top_p": 0.9},
+        },
+        timeout=180,
+    )
+
+    if r2.status_code != 404 and r2.ok:
+        data = r2.json()
+        text = (data.get("response", "") or "").strip()
+        if text:
+            return text
+
+    # If we get here, return useful Ollama error
+    err = ""
+    try:
+        err = r.json().get("error") or ""
+    except Exception:
+        pass
+    if not err:
+        try:
+            err = r2.json().get("error") or ""
+        except Exception:
+            pass
+    if not err:
+        err = f"chat={r.status_code}, generate={r2.status_code}"
+    raise RuntimeError(f"Ollama generation failed: {err}")
+
+
+# ============================================================
+# Anti-repeat helpers
+# ============================================================
+def normalize_one_sentence(text: str) -> str:
+    t = (text or "").strip().strip("`").strip()
+
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1].strip()
+
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if lines:
+        t = lines[0]
+
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    if parts and len(parts[0].strip()) >= 2:
+        t = parts[0].strip()
+
+    return t.strip().strip('"').strip("'").strip()
+
+
+def has_4gram_overlap(a: str, b: str) -> bool:
+    def grams(s: str) -> set:
+        s = re.sub(r"\s+", " ", (s or "").strip().lower())
+        words = s.split()
+        return {" ".join(words[i:i + 4]) for i in range(len(words) - 3)}
+
+    ga, gb = grams(a), grams(b)
+    return bool(ga and gb and ga.intersection(gb))
+
+
+def token_jaccard(a: str, b: str) -> float:
+    wa = set(re.findall(r"\w+", (a or "").lower()))
+    wb = set(re.findall(r"\w+", (b or "").lower()))
+    if not wa and not wb:
+        return 1.0
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def too_similar(a: str, b: str, threshold: float = 0.72) -> bool:
+    return token_jaccard(a, b) >= threshold
+
+
+# ============================================================
+# Prompting (FIXED template + user controls only "style" phrase)
+# ============================================================
+def make_prompt(
+    input_text: str,
+    step_i: int,
+    banned_word: Optional[str],
+    previous_outputs: Optional[List[str]],
+    style: Optional[str],
+) -> str:
+    banned_clause = ""
+    if banned_word and banned_word.strip():
+        banned_clause += f'\n- Do NOT use this exact word anywhere: "{banned_word.strip()}"'
+
+    banned_prev = ""
+    if previous_outputs:
+        last_few = previous_outputs[-3:]
+        banned_prev = "\n- Do NOT output any of these exact sentences:\n" + "\n".join(
+            [f"  * {s}" for s in last_few]
+        )
+
+    style_line = ""
+    s = (style or "").strip()
+    if s:
+        # user can change ONLY this part
+        style_line = f"\n- Style constraint: Make the sentence feel {s}. Keep it related to the input."
+
+    return f"""Rewrite the INPUT TEXT using different wording.
+
+Rules:
+- Output EXACTLY ONE sentence.
+- Output ONLY the sentence (no quotes, no lists, no extra text).
+- Do NOT reuse any sequence of 4 or more consecutive words from the input.
+{banned_prev}
+{banned_clause}
+{style_line}
+
+INPUT TEXT:
+{input_text}
+""".strip()
+
+
+def generate_with_retries(
+    model: str,
+    input_text: str,
+    step_i: int,
+    previous_outputs: List[str],
+    banned_word: Optional[str],
+    temperature: float,
+    style: Optional[str],
+    max_retries: int = 4,
+) -> str:
+    last = ""
+    temp = float(temperature)
+
+    # Similarity tolerance decreases as drift increases
+    sim_threshold = (
+        0.72 if step_i <= 1
+        else 0.62 if step_i == 2
+        else 0.55
+    )
+
+    for _ in range(max_retries):
+        prompt = make_prompt(
+            input_text=input_text,
+            step_i=step_i,
+            banned_word=banned_word,
+            previous_outputs=previous_outputs,
+            style=style,
+        )
+
+        out = ollama_generate(model=model, prompt=prompt, temperature=temp)
+        out = normalize_one_sentence(out)
+        last = out
+
+        if not out:
+            temp = min(1.4, temp + 0.2)
+            continue
+
+        if out.strip().lower() == input_text.strip().lower():
+            temp = min(1.4, temp + 0.2)
+            continue
+
+        if has_4gram_overlap(input_text, out):
+            temp = min(1.4, temp + 0.25)
+            continue
+
+        if too_similar(input_text, out, threshold=sim_threshold):
+            temp = min(1.4, temp + 0.25)
+            continue
+
+        if any(out.strip().lower() == p.strip().lower() for p in previous_outputs):
+            temp = min(1.4, temp + 0.25)
+            continue
+
+        return out
+
+    return last
+
+
+# ============================================================
+# FastAPI app
+# ============================================================
+app = FastAPI()
+
+
+class RunRequest(BaseModel):
+    word: str
+    iterations: int = 8
+    model: str = DEFAULT_MODEL
+    temperature: float = 0.8
+    style: str = ""  # NEW (user controls only this small part)
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(HTML_PAGE, headers=NO_CACHE_HEADERS)
+
+
+@app.get("/api/models")
+def models():
+    try:
+        return JSONResponse({"models": ollama_list_models()}, headers=NO_CACHE_HEADERS)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=NO_CACHE_HEADERS)
+
+
+# ---------- ORIGINAL (non-stream) ----------
+@app.post("/api/run")
+def run(req: RunRequest):
+    first_word = (req.word or "").strip()
+    if not first_word:
+        return JSONResponse({"error": "Please enter a word."}, status_code=400)
+
+    iterations = max(2, min(10, int(req.iterations)))
+    temperature = float(req.temperature)
+    style = (req.style or "").strip()
+
+    try:
+        model = pick_model(req.model or DEFAULT_MODEL)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    chain: List[Dict[str, Any]] = []
+    prev = first_word
+    previous_outputs: List[str] = []
+
+    try:
+        for i in range(1, iterations + 1):
+            out = generate_with_retries(
+                model=model,
+                input_text=prev,
+                step_i=i,
+                previous_outputs=previous_outputs,
+                banned_word=first_word if i == 1 else None,
+                temperature=temperature,
+                style=style,
+                max_retries=4,
+            )
+
+            chain.append({"i": i, "input": prev, "output": out})
+            previous_outputs.append(out)
+            prev = out
+            time.sleep(0.02)
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=NO_CACHE_HEADERS)
+
+    return JSONResponse(
+        {
+            "summary": {"first_word": first_word, "final": chain[-1]["output"], "model_used": model},
+            "chain": chain,
+        },
+        headers=NO_CACHE_HEADERS,
+    )
+
+
+# ---------- SSE (stream one-by-one) ----------
+@app.get("/api/run/stream")
+def run_stream(
+    word: str,
+    iterations: int = 8,
+    model: str = DEFAULT_MODEL,
+    temperature: float = 0.8,
+    style: str = "",  # NEW
+):
+    first_word = (word or "").strip()
+    if not first_word:
+        return JSONResponse({"error": "Please enter a word."}, status_code=400, headers=NO_CACHE_HEADERS)
+
+    iterations = max(2, min(10, int(iterations)))
+    temperature = float(temperature)
+    style = (style or "").strip()
+
+    try:
+        model_used = pick_model(model or DEFAULT_MODEL)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=NO_CACHE_HEADERS)
+
+    def sse(data: dict) -> str:
+        return "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+
+    def event_gen():
+        prev = first_word
+        previous_outputs: List[str] = []
+
+        # start event
+        yield sse(
+            {
+                "type": "start",
+                "first_word": first_word,
+                "model_used": model_used,
+                "iterations": iterations,
+                "style": style,
+            }
+        )
+
+        try:
+            for i in range(1, iterations + 1):
+                out = generate_with_retries(
+                    model=model_used,
+                    input_text=prev,
+                    step_i=i,
+                    previous_outputs=previous_outputs,
+                    banned_word=first_word if i == 1 else None,
+                    temperature=temperature,
+                    style=style,
+                    max_retries=4,
+                )
+
+                step = {"i": i, "input": prev, "output": out}
+                previous_outputs.append(out)
+                prev = out
+
+                # step event (one-by-one)
+                yield sse({"type": "step", "step": step})
+
+            # done event
+            yield sse({"type": "done", "final": prev})
+
+        except Exception as e:
+            yield sse({"type": "error", "error": str(e)})
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            **NO_CACHE_HEADERS,
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================================
+# HTML UI (TIMELINE / VERTICAL ARROW) + SOUND ALWAYS ON
+# + NEW: "Style" input (only user-controlled part of the prompt)
+# ============================================================
+HTML_PAGE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Elsewhere</title>
+  <style>
+    :root{
+      --bg0: #070a10;
+      --bg1: #0b1220;
+      --panel: rgba(255,255,255,0.06);
+      --line: rgba(255,255,255,0.10);
+
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.62);
+
+      --acc1: #39ff88;
+      --acc2: #55c2ff;
+      --acc3: #b07cff;
+
+      --shadow: 0 18px 60px rgba(0,0,0,0.50);
+      --radius: 22px;
+
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    *{ box-sizing:border-box; }
+
+    body{
+      margin:0;
+      min-height:100vh;
+      color: var(--text);
+      font-family: var(--sans);
+
+      background:
+        radial-gradient(900px 600px at 15% 20%, rgba(255, 80, 170, 0.85), transparent 60%),
+        radial-gradient(900px 700px at 85% 15%, rgba(160, 90, 255, 0.85), transparent 60%),
+        radial-gradient(900px 700px at 70% 80%, rgba(80, 220, 200, 0.85), transparent 60%),
+        radial-gradient(900px 600px at 25% 85%, rgba(255, 235, 90, 0.85), transparent 60%),
+        linear-gradient(180deg, #1a0826, #05010a);
+
+      position: relative;
+      overflow-x: hidden;
+    }
+
+    body:before{
+      content:"";
+      position: fixed;
+      inset:-40px;
+      pointer-events:none;
+
+      background:
+        radial-gradient(1200px 800px at 20% 25%, rgba(255, 100, 180, 0.35), transparent 65%),
+        radial-gradient(1200px 800px at 80% 30%, rgba(180, 120, 255, 0.35), transparent 65%),
+        radial-gradient(1200px 900px at 65% 80%, rgba(100, 240, 220, 0.30), transparent 65%),
+        radial-gradient(1200px 800px at 30% 85%, rgba(255, 240, 120, 0.30), transparent 65%);
+
+      filter: blur(80px);
+      opacity: 0.9;
+    }
+
+    .wrap{
+      max-width: 1050px;
+      margin: 0 auto;
+      padding: 34px 18px 72px;
+    }
+
+    header{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-end;
+      gap:16px;
+      margin-bottom: 18px;
+    }
+
+    .brand{ display:flex; flex-direction:column; gap:8px; }
+
+    h1{
+      margin:0;
+      font-size: 30px;
+      line-height:1.1;
+      letter-spacing: 0.2px;
+      font-family: var(--mono);
+      background: linear-gradient(90deg, var(--acc1), var(--acc2));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      filter: drop-shadow(0 10px 18px rgba(0,0,0,0.30));
+    }
+
+    .sub{
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    .inputArea{ display:grid; gap: 12px; margin-top: 14px; }
+
+    .inputShell{
+      border-radius: var(--radius);
+      padding: 14px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow:hidden;
+    }
+
+    .inputShell:before{
+      content:"";
+      position:absolute; inset:-2px;
+      background:
+        radial-gradient(600px 180px at 15% 15%, rgba(57,255,136,0.16), transparent 60%),
+        radial-gradient(700px 220px at 85% 30%, rgba(85,194,255,0.14), transparent 60%);
+      pointer-events:none;
+      filter: blur(12px);
+      opacity: 0.85;
+    }
+
+    textarea{
+      position: relative;
+      width:100%;
+      min-height: 96px;
+      resize: vertical;
+      padding: 16px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.35);
+      color: var(--text);
+      outline: none;
+      font-size: 16px;
+      line-height: 1.5;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+    }
+    textarea:focus{
+      border-color: rgba(85,194,255,0.40);
+      box-shadow:
+        0 0 0 4px rgba(85,194,255,0.10),
+        0 0 0 1px rgba(57,255,136,0.10),
+        inset 0 0 0 1px rgba(255,255,255,0.05);
+    }
+
+    .labelRow{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      margin: 10px 2px 6px;
+      gap: 10px;
+      font-family: var(--mono);
+      color: rgba(255,255,255,0.70);
+      font-size: 12px;
+    }
+
+    .styleInput{
+      width:100%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.35);
+      color: rgba(255,255,255,0.92);
+      outline: none;
+      font-size: 14px;
+      font-family: var(--sans);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+    }
+    .styleInput:focus{
+      border-color: rgba(85,194,255,0.40);
+      box-shadow: 0 0 0 4px rgba(85,194,255,0.10);
+    }
+
+    .hint{
+      color: rgba(255,255,255,0.55);
+      font-size: 12px;
+      line-height: 1.35;
+      margin: 8px 2px 0;
+      font-family: var(--mono);
+    }
+
+    .actions{
+      display:flex;
+      align-items:center;
+      gap: 12px;
+      flex-wrap:wrap;
+      margin-top: 12px;
+    }
+
+    .btn{
+      cursor:pointer;
+      padding: 11px 16px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.14);
+      color: rgba(255,255,255,0.92);
+      font-weight: 800;
+      letter-spacing: 0.2px;
+      font-family: var(--mono);
+      background: linear-gradient(180deg, rgba(57,255,136,0.22), rgba(85,194,255,0.18));
+      box-shadow:
+        0 14px 30px rgba(0,0,0,0.35),
+        0 0 0 1px rgba(57,255,136,0.10);
+      transition: transform 0.06s ease, filter 0.15s ease, box-shadow 0.2s ease;
+      user-select:none;
+    }
+    .btn:hover{
+      filter: brightness(1.08);
+      box-shadow:
+        0 18px 40px rgba(0,0,0,0.42),
+        0 0 0 1px rgba(85,194,255,0.16),
+        0 0 24px rgba(57,255,136,0.10);
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btn[disabled]{ opacity: 0.6; cursor:not-allowed; filter: grayscale(20%); }
+
+    .status{
+      color: var(--muted);
+      font-size: 13px;
+      display:flex;
+      align-items:center;
+      gap: 8px;
+      font-family: var(--mono);
+    }
+
+    .spinner{
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      border: 2px solid rgba(255,255,255,0.22);
+      border-top-color: rgba(255,255,255,0.82);
+      animation: spin 0.9s linear infinite;
+      display:none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .linkbtn{
+      cursor:pointer;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.28);
+      color: rgba(255,255,255,0.86);
+      font-size: 12px;
+      font-family: var(--mono);
+      transition: transform 0.06s ease, filter 0.15s ease;
+      user-select:none;
+    }
+    .linkbtn:hover{ filter: brightness(1.08); }
+    .linkbtn:active{ transform: translateY(1px); }
+
+    .error{
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,90,90,0.35);
+      background: rgba(255,90,90,0.10);
+      color: rgba(255,255,255,0.92);
+      box-shadow: 0 16px 40px rgba(0,0,0,0.28);
+      font-family: var(--mono);
+    }
+
+    .summary{
+      margin-top: 16px;
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: var(--shadow);
+      display:none;
+
+      position: sticky;
+      top: 14px;
+      z-index: 20;
+      backdrop-filter: blur(10px);
+    }
+
+    .badge{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.22);
+      color: rgba(255,255,255,0.78);
+      font-size: 13px;
+      font-family: var(--mono);
+      width: fit-content;
+    }
+
+    .io{
+      margin-top: 12px;
+      display:grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    @media (min-width: 860px){
+      .io{ grid-template-columns: 1fr 1fr; }
+    }
+
+    .k{ color: var(--muted); font-size: 12px; margin-bottom: 6px; font-family: var(--mono); }
+
+    .v{
+      white-space: pre-wrap;
+      line-height: 1.55;
+      background: rgba(0,0,0,0.28);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 16px;
+      padding: 12px 12px;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+      font-family: var(--sans);
+    }
+
+    .copy{
+      margin-top: 10px;
+      display:flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items:center;
+      justify-content:flex-end;
+    }
+
+    .cards{
+      margin-top: 14px;
+      display:none;
+      gap: 12px;
+    }
+
+    .timeline{ display: grid; gap: 10px; }
+
+    .tItem{
+      position: relative;
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .rail{
+      position: relative;
+      display:flex;
+      align-items:flex-start;
+      justify-content:center;
+      padding-top: 12px;
+    }
+
+    .dot{
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.82);
+      box-shadow:
+        0 0 0 3px rgba(85,194,255,0.18),
+        0 0 18px rgba(57,255,136,0.12);
+      transform: translateY(2px);
+    }
+
+    .line{
+      position: absolute;
+      top: 18px;
+      bottom: -12px;
+      width: 2px;
+      background: linear-gradient(
+        180deg,
+        rgba(255,255,255,0.35),
+        rgba(255,255,255,0.10)
+      );
+      border-radius: 999px;
+    }
+
+    .tBox{
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: 0 14px 32px rgba(0,0,0,0.30);
+      opacity: 0.55;
+      transform: scale(0.99);
+      transition:
+        opacity 0.35s ease,
+        transform 0.35s ease,
+        box-shadow 0.35s ease,
+        border-color 0.35s ease,
+        filter 0.35s ease;
+      position: relative;
+      overflow:hidden;
+    }
+
+    .tBox.active{
+      opacity: 1;
+      transform: scale(1.02);
+      border-color: rgba(85,194,255,0.28);
+      box-shadow:
+        0 24px 60px rgba(0,0,0,0.52),
+        0 0 0 1px rgba(57,255,136,0.10),
+        0 0 30px rgba(85,194,255,0.10);
+      filter: saturate(1.07);
+    }
+
+    .tBox.past{
+      opacity: 0.70;
+      transform: scale(1.00);
+      filter: saturate(0.95);
+    }
+
+    .tMeta{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-family: var(--mono);
+      color: rgba(255,255,255,0.65);
+      font-size: 12px;
+    }
+
+    .tText{
+      white-space: pre-wrap;
+      line-height: 1.6;
+      background: rgba(0,0,0,0.22);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 16px;
+      padding: 12px 12px;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+    }
+
+    .tBox.active:before{
+      content:"";
+      position:absolute;
+      inset:-40px;
+      background:
+        linear-gradient(120deg,
+          transparent 20%,
+          rgba(85,194,255,0.10) 45%,
+          rgba(57,255,136,0.10) 55%,
+          transparent 80%);
+      transform: translateX(-30%);
+      animation: shine 0.95s ease-out 1;
+      pointer-events:none;
+      filter: blur(1px);
+      opacity: 0.85;
+    }
+
+    @keyframes shine{
+      from { transform: translateX(-35%); opacity: 0.0; }
+      30% { opacity: 1.0; }
+      to { transform: translateX(35%); opacity: 0.0; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <h1>ElseWhere</h1>
+        <div class="sub">A thought, slowly becoming something else.</div>
+      </div>
+    </header>
+
+    <div class="inputArea">
+      <div class="inputShell">
+        <textarea id="word" placeholder="Write a word or a sentence…"></textarea>
+
+        <div class="labelRow">
+          <span>Style</span>
+          
+        </div>
+        <input class="styleInput" id="style" placeholder="dramatic / weird / surreal / scary / poetic …" />
+
+        <div class="hint">
+          Leave empty = normal.
+        </div>
+
+        <div class="actions">
+          <button class="btn" id="run">Run</button>
+
+          <div class="status">
+            <span class="spinner" id="spin"></span>
+            <span id="status"></span>
+          </div>
+
+          <button class="linkbtn" id="skip" style="display:none" title="Show all now">Skip</button>
+          <button class="linkbtn" id="clearStyle" title="Clear style box">Clear style</button>
+        </div>
+      </div>
+    </div>
+
+    <section id="err" style="display:none" class="error"></section>
+
+    <section id="summary" class="summary">
+      <div class="badge">Start → Current</div>
+      <div class="io">
+        <div>
+          <div class="k">Start</div>
+          <div class="v" id="startText"></div>
+        </div>
+        <div>
+          <div class="k">Current output</div>
+          <div class="v" id="finalText"></div>
+          <div class="copy">
+            <button class="linkbtn" id="copyFinal">Copy current</button>
+            <button class="linkbtn" id="copyAll">Copy all</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="cards" class="cards"></section>
+  </div>
+
+<script>
+  const el = (id) => document.getElementById(id);
+
+  function setStatus(msg){ el("status").textContent = msg || ""; }
+  function setLoading(on){
+    el("spin").style.display = on ? "inline-block" : "none";
+    el("run").disabled = !!on;
+  }
+
+  function showError(msg){
+    const box = el("err");
+    box.style.display = "block";
+    box.textContent = msg;
+  }
+  function clearError(){
+    const box = el("err");
+    box.style.display = "none";
+    box.textContent = "";
+  }
+
+  function escapeHTML(str){
+    return (str || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  // ---- SOUND (always ON; unlocked on Run click) ----
+  const soundOn = true;
+  let audioCtx = null;
+
+  async function ensureAudio(){
+    if(!soundOn) return;
+    try{
+      if(!audioCtx){
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if(audioCtx.state === "suspended"){
+        await audioCtx.resume();
+      }
+      const t0 = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(220, t0);
+      gain.gain.setValueAtTime(0.00001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.00002, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.00001, t0 + 0.04);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.05);
+    }catch(e){}
+  }
+
+  function tick(){
+    if(!soundOn || !audioCtx) return;
+    try{
+      const t0 = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(980, t0);
+      osc.frequency.exponentialRampToValueAtTime(620, t0 + 0.06);
+
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.09, t0 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.085);
+
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+
+      osc.start(t0);
+      osc.stop(t0 + 0.095);
+    }catch(e){}
+  }
+
+  // ---- TIMELINE item ----
+  function timelineItemHTML(label, text, isLast){
+    return `
+      <div class="tItem">
+        <div class="rail">
+          <div class="dot"></div>
+          ${isLast ? "" : `<div class="line"></div>`}
+        </div>
+
+        <div class="tBox active">
+          <div class="tMeta">
+            <span>${escapeHTML(label)}</span>
+            <span>↓</span>
+          </div>
+          <div class="tText">${escapeHTML(text)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function buildCopyAll(chain){
+    return chain.map((s, idx) => `#${idx+1}\nFROM: ${s.input}\nTO: ${s.output}\n`).join("\n");
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function showLoadingSkeleton(){
+    const cards = el("cards");
+    cards.style.display = "grid";
+    cards.innerHTML = `
+      <div class="timeline">
+        <div class="tItem">
+          <div class="rail">
+            <div class="dot"></div>
+            <div class="line"></div>
+          </div>
+          <div class="tBox active">
+            <div class="tMeta"><span>Generating…</span><span>↓</span></div>
+            <div class="tText">Waiting for the stream</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ---- SKIP control ----
+  let skipAnim = false;
+  el("skip").addEventListener("click", () => { skipAnim = true; });
+
+  // ---- CLEAR STYLE ----
+  el("clearStyle").addEventListener("click", () => {
+    el("style").value = "";
+    setStatus("Style cleared.");
+  });
+
+  // ---- SSE handle ----
+  let evt = null;
+
+  async function run(){
+    clearError();
+    setStatus("Running…");
+    setLoading(true);
+
+    await ensureAudio();
+
+    const word = el("word").value.trim();
+    if(!word){
+      showError("Please write a word or a sentence.");
+      setStatus("");
+      setLoading(false);
+      return;
+    }
+
+    const style = el("style").value.trim();
+
+    // show the compare box immediately
+    el("startText").textContent = word;
+    el("finalText").textContent = "Generating…";
+    el("summary").style.display = "block";
+
+    showLoadingSkeleton();
+
+    // reset skip state + show skip button
+    skipAnim = false;
+    el("skip").style.display = "inline-flex";
+
+    // close previous stream if any
+    if(evt){ try{ evt.close(); }catch(e){} evt = null; }
+
+    // timeline container
+    const cards = el("cards");
+    cards.style.display = "grid";
+    cards.innerHTML = `<div class="timeline" id="timeline"></div>`;
+    const timeline = document.getElementById("timeline");
+
+    // Start node now
+    timeline.insertAdjacentHTML("beforeend", timelineItemHTML("Start", word, false));
+
+    const chain = [];
+
+    // copy buttons
+    el("copyFinal").onclick = async () => {
+      try { await navigator.clipboard.writeText(el("finalText").textContent || ""); setStatus("Copied."); }
+      catch(e){ setStatus("Copy failed."); }
+    };
+    el("copyAll").onclick = async () => {
+      try { await navigator.clipboard.writeText(buildCopyAll(chain)); setStatus("Copied all."); }
+      catch(e){ setStatus("Copy failed."); }
+    };
+
+    // pacing
+    const minDelay = 380;
+    const maxDelay = 1150;
+    const msPerWord = 85;
+
+    let stepIndex = 0;
+
+    // open stream (backend defaults 6 iterations) + NEW style param
+    const url = `/api/run/stream?word=${encodeURIComponent(word)}&style=${encodeURIComponent(style)}`;
+    evt = new EventSource(url);
+
+    evt.onmessage = async (ev) => {
+      let msg = {};
+      try { msg = JSON.parse(ev.data || "{}"); } catch(e){}
+
+      if(msg.type === "start"){
+        el("startText").textContent = msg.first_word || word;
+        const st = (msg.style || "").trim();
+        setStatus(`Model: ${msg.model_used || ""}${st ? " | Style: " + st : ""}`);
+        return;
+      }
+
+      if(msg.type === "step"){
+        const step = msg.step;
+        if(!step) return;
+
+        chain.push(step);
+
+        // mark previous active as past
+        const prevActive = timeline.querySelector(".tBox.active");
+        if(prevActive){
+          prevActive.classList.remove("active");
+          prevActive.classList.add("past");
+        }
+
+        timeline.insertAdjacentHTML(
+          "beforeend",
+          timelineItemHTML(`Output ${step.i}`, step.output, false)
+        );
+
+        el("finalText").textContent = step.output;
+        setStatus(`Iteration ${step.i}`);
+
+        tick();
+        timeline.lastElementChild.scrollIntoView({ behavior: "smooth", block: "center" });
+
+        // Delay only if not skipped (but first output is instant)
+        if(stepIndex > 0 && !skipAnim){
+          const words = (step.output || "").trim().split(/\s+/).filter(Boolean).length;
+          const delay = Math.min(maxDelay, Math.max(minDelay, words * msPerWord));
+          await sleep(delay);
+        }
+        stepIndex++;
+
+        return;
+      }
+
+      if(msg.type === "done"){
+        setStatus("Done");
+        setLoading(false);
+        el("skip").style.display = "none";
+        if(evt){ evt.close(); evt = null; }
+
+        // Remove the last rail line so the last item ends cleanly
+        const lines = timeline.querySelectorAll(".line");
+        if(lines.length) lines[lines.length - 1].remove();
+
+        return;
+      }
+
+      if(msg.type === "error"){
+        showError(msg.error || "Unknown error");
+        setStatus("");
+        setLoading(false);
+        el("skip").style.display = "none";
+        if(evt){ evt.close(); evt = null; }
+        return;
+      }
+    };
+
+    evt.onerror = () => {
+      if(el("run").disabled){
+        showError("Stream connection lost.");
+        setStatus("");
+        setLoading(false);
+        el("skip").style.display = "none";
+      }
+      if(evt){ try{ evt.close(); }catch(e){} evt = null; }
+    };
+  }
+
+  el("run").addEventListener("click", run);
+
+  document.addEventListener("keydown", (e)=>{
+    const isMac = navigator.platform.toUpperCase().includes("MAC");
+    const mod = isMac ? e.metaKey : e.ctrlKey;
+    if(mod && e.key === "Enter") run();
+  });
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
